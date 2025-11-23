@@ -1,0 +1,10 @@
+pandas
+openpyxl
+matplotlib
+openai
+PyMuPDF
+PyPDF2
+reportlab
+pytesseract
+Pillow
+
