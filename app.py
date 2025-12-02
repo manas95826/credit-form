@@ -4,6 +4,7 @@ from openpyxl.utils import range_boundaries, get_column_letter
 import json
 import os
 import shutil
+import re
 from openai import OpenAI
 
 # Copy the template file first to preserve all formatting
@@ -40,87 +41,193 @@ LABEL_KEYWORDS = [
     'firma', 'fecha de', 'lugar de', 'hora', 'folio', 'referencia', 'número', 'numero'
 ]
 
-# Collect all potential fields first (before filtering)
+# Helper function to check if a cell is part of a merged range (but not the top-left)
+def is_merged_cell_but_not_top_left(cell):
+    """Check if cell is a MergedCell (not the writable top-left)"""
+    return isinstance(cell, MergedCell)
+
+# Helper function to check if a cell is the top-left of a merged range
+def is_top_left_of_merged(cell_coord, merged_map):
+    """Check if a cell coordinate is the top-left of any merged range"""
+    for merged_range, top_left in merged_map.items():
+        if cell_coord == top_left:
+            return True
+    return False
+
+# Helper function to get the cell value safely
+def get_cell_value(cell):
+    """Safely get cell value, handling MergedCell"""
+    if isinstance(cell, MergedCell):
+        return None
+    return cell.value
+
+# Helper function to check if a cell is empty
+def is_cell_empty(cell):
+    """Check if a cell is empty or contains only whitespace"""
+    if isinstance(cell, MergedCell):
+        return True  # Merged cells (non-top-left) are considered empty
+    value = cell.value
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
+# Helper function to find the field cell to the right of a potential label
+def find_field_cell_to_right(label_cell, merged_map):
+    """Find the field cell that's to the right of a label cell"""
+    row_idx = label_cell.row
+    col_idx = label_cell.column
+    
+    # Skip if this cell is a MergedCell (not top-left)
+    if is_merged_cell_but_not_top_left(label_cell):
+        return None
+    
+    # Skip if this cell is the top-left of a merged range (it's likely a field value, not a label)
+    if is_top_left_of_merged(label_cell.coordinate, merged_map):
+        return None
+    
+    # Field is usually the next cell to the right
+    field_col = col_idx + 1
+    
+    # Check if field cell is part of a merged range
+    for merged_range, top_left in merged_map.items():
+        try:
+            min_col, min_row, max_col, max_row = range_boundaries(merged_range)
+            if min_row <= row_idx <= max_row and min_col <= field_col <= max_col:
+                # Field cell is in this merged range
+                # Check if the top-left of this merged range is empty
+                top_left_cell = ws[top_left]
+                if is_cell_empty(top_left_cell):
+                    return merged_range
+                else:
+                    return None  # Merged range already has data
+        except:
+            continue
+    
+    # Not merged, check single cell
+    try:
+        field_cell = ws.cell(row=row_idx, column=field_col)
+        if is_cell_empty(field_cell):
+            return field_cell.coordinate
+    except:
+        pass
+    
+    return None
+
+# Helper function to determine if text looks like a label (not a field value)
+def looks_like_label(text):
+    """Determine if text looks like a form label rather than a field value"""
+    if not text or not isinstance(text, str):
+        return False
+    
+    text = text.strip()
+    
+    # Too short or too long
+    if len(text) < 2 or len(text) > 40:
+        return False
+    
+    text_lower = text.lower()
+    
+    # Must end with colon OR contain form keywords
+    ends_with_colon = text.rstrip().endswith(':')
+    has_keyword = any(keyword in text_lower for keyword in LABEL_KEYWORDS)
+    
+    if not (ends_with_colon or has_keyword):
+        return False
+    
+    # Additional heuristics: labels are usually shorter and don't contain certain patterns
+    # Field values often contain:
+    # - Numbers in the middle (like addresses, phone numbers)
+    # - Special characters like @, /, -, (
+    # - Very long text
+    
+    # If it has numbers in the middle (not just at start/end), it's likely a field value
+    if re.search(r'\d+', text) and not text[0].isdigit() and not text[-1].isdigit():
+        # Has numbers but not at start/end - could be a field value
+        # But if it ends with colon, it's still a label
+        if not ends_with_colon:
+            return False
+    
+    # If it contains @, it's likely an email field value, not a label
+    if '@' in text and 'email' not in text_lower and 'correo' not in text_lower:
+        return False
+    
+    # If it starts with "http" or "www", it's a URL field value
+    if text_lower.startswith(('http', 'www')):
+        return False
+    
+    return True
+
+# Collect all potential fields with improved detection
 all_potential_fields = {}
+
+print("\n=== SCANNING FOR FORM FIELDS ===")
 
 for row in ws.iter_rows():
     for cell in row:
-        if cell.value and isinstance(cell.value, str):
-            label = cell.value.strip()
+        if not cell.value or not isinstance(cell.value, str):
+            continue
+        
+        # Skip if this cell is a MergedCell (not top-left)
+        if is_merged_cell_but_not_top_left(cell):
+            continue
+        
+        # Skip if this cell is the top-left of a merged range (likely a field value)
+        if is_top_left_of_merged(cell.coordinate, merged_map):
+            continue
+        
+        label = cell.value.strip()
+        
+        # Check if this looks like a label
+        if not looks_like_label(label):
+            continue
+        
+        # Additional check: If there's significant text to the left, this might be a field value
+        # Labels are usually in the leftmost columns or have empty cells to their left
+        row_idx = cell.row
+        col_idx = cell.column
+        if col_idx > 1:  # Not in first column
+            try:
+                left_cell = ws.cell(row=row_idx, column=col_idx - 1)
+                left_value = get_cell_value(left_cell)
+                # If left cell has substantial text, current cell might be a field value
+                if left_value and isinstance(left_value, str) and len(left_value.strip()) > 10:
+                    # But if current cell ends with colon, it's still likely a label
+                    if not label.rstrip().endswith(':'):
+                        continue
+            except:
+                pass
+        
+        # Find the field cell to the right
+        target = find_field_cell_to_right(cell, merged_map)
+        
+        if target is None:
+            continue  # No valid field cell found
+        
+        # Verify the field cell is actually empty
+        try:
+            if ":" in target:
+                top_left = target.split(":")[0]
+                field_cell = ws[top_left]
+            else:
+                field_cell = ws[target]
             
-            # find the field cell(s)
-            row_idx = cell.row
-            col_idx = cell.column
-            
-            # field is usually the next cell to the right
-            field_cell = ws.cell(row=row_idx, column=col_idx+1)
-            
-            # detect merged region
-            target = None
-            for m in merged_map:
-                top_left = merged_map[m]
-                if ws[top_left].row == row_idx and ws[top_left].column == col_idx+1:
-                    target = m  # merged range
-                    break
-            
-            if target is None:
-                target = field_cell.coordinate  # single cell
-            
+            if not is_cell_empty(field_cell):
+                continue  # Field already has data
+        except Exception as e:
+            continue  # Skip if we can't verify
+        
+        # All checks passed - this is a valid label -> field mapping
+        # Use the first occurrence if duplicate labels exist
+        if label not in all_potential_fields:
             all_potential_fields[label] = target
 
 print("\n=== FIELD DETECTION ANALYSIS ===")
-print(f"Total potential fields found (before filtering): {len(all_potential_fields)}")
+print(f"Total potential fields found (after improved filtering): {len(all_potential_fields)}")
 
-# Now apply filtering logic
-fields = {}
+# Final fields dictionary (already filtered)
+fields = all_potential_fields
 
-for label, target in all_potential_fields.items():
-    # Filter condition 1: Skip cells with less than 3 characters
-    if len(label) < 3:
-        continue
-    
-    # Filter condition 2: Only include cells with form field keywords or ending with ':'
-    label_lower = label.lower().strip()
-    has_keyword = any(keyword in label_lower for keyword in LABEL_KEYWORDS)
-    ends_with_colon = label.rstrip().endswith(':')
-    
-    if not (has_keyword or ends_with_colon):
-        continue
-    
-    # Filter condition 3: Check if the next cell to the right is EMPTY
-    # If it already has data, skip it since it's not a fillable field
-    try:
-        # Extract row and column from target
-        if ":" in target:
-            # For merged cells, get the top-left cell
-            top_left = target.split(":")[0]
-            field_cell = ws[top_left]
-        else:
-            field_cell = ws[target]
-        
-        # Check if the field cell is empty (or contains only whitespace)
-        field_value = field_cell.value
-        is_empty = field_value is None or (isinstance(field_value, str) and field_value.strip() == "")
-        
-        if not is_empty:
-            # Field already has data, skip it
-            continue
-    except Exception as e:
-        # If we can't check the cell, skip it to be safe
-        print(f"  Warning: Could not check field cell for '{label}': {e}")
-        continue
-    
-    # All conditions passed - add to fields dictionary
-    fields[label] = target
+print(f"Total fields found: {len(fields)}")
 
-print(f"Total fields found (after filtering): {len(fields)}")
-print(f"Fields filtered out: {len(all_potential_fields) - len(fields)}")
-if len(all_potential_fields) > 0:
-    print(f"Filtering efficiency: {((len(all_potential_fields) - len(fields)) / len(all_potential_fields) * 100):.1f}% reduction")
-else:
-    print("Filtering efficiency: N/A (no potential fields found)")
-
-print("\nFiltered fields extracted:")
+print("\nDetected fields (label -> field cell):")
 for label, target in fields.items():
     print(f"  '{label}' -> {target}")
 
