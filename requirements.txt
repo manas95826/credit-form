@@ -1,10 +1,6 @@
-pandas
+fastapi
+uvicorn[standard]
+python-multipart
 openpyxl
-matplotlib
 openai
-PyMuPDF
-PyPDF2
-reportlab
-pytesseract
-Pillow
-
+requests
