@@ -69,9 +69,10 @@ def is_cell_empty(cell):
     value = cell.value
     return value is None or (isinstance(value, str) and value.strip() == "")
 
-# Helper function to find the field cell to the right of a potential label
-def find_field_cell_to_right(label_cell, merged_map):
-    """Find the field cell that's to the right of a label cell"""
+# Helper function to find the field cell in multiple directions
+def find_field_cell(label_cell, merged_map):
+    """Find the field cell that's associated with a label cell.
+    Checks multiple directions: right (most common), below, and left."""
     row_idx = label_cell.row
     col_idx = label_cell.column
     
@@ -83,31 +84,43 @@ def find_field_cell_to_right(label_cell, merged_map):
     if is_top_left_of_merged(label_cell.coordinate, merged_map):
         return None
     
-    # Field is usually the next cell to the right
-    field_col = col_idx + 1
+    # Try different directions in order of likelihood
+    directions = [
+        (0, 1),   # Right (most common)
+        (1, 0),   # Below
+        (0, -1),  # Left (less common, but sometimes labels are on the right)
+    ]
     
-    # Check if field cell is part of a merged range
-    for merged_range, top_left in merged_map.items():
-        try:
-            min_col, min_row, max_col, max_row = range_boundaries(merged_range)
-            if min_row <= row_idx <= max_row and min_col <= field_col <= max_col:
-                # Field cell is in this merged range
-                # Check if the top-left of this merged range is empty
-                top_left_cell = ws[top_left]
-                if is_cell_empty(top_left_cell):
-                    return merged_range
-                else:
-                    return None  # Merged range already has data
-        except:
+    for row_offset, col_offset in directions:
+        field_row = row_idx + row_offset
+        field_col = col_idx + col_offset
+        
+        # Skip if out of bounds
+        if field_row < 1 or field_col < 1:
             continue
-    
-    # Not merged, check single cell
-    try:
-        field_cell = ws.cell(row=row_idx, column=field_col)
-        if is_cell_empty(field_cell):
-            return field_cell.coordinate
-    except:
-        pass
+        
+        # Check if field cell is part of a merged range
+        for merged_range, top_left in merged_map.items():
+            try:
+                min_col, min_row, max_col, max_row = range_boundaries(merged_range)
+                if min_row <= field_row <= max_row and min_col <= field_col <= max_col:
+                    # Field cell is in this merged range
+                    # Check if the top-left of this merged range is empty
+                    top_left_cell = ws[top_left]
+                    if is_cell_empty(top_left_cell):
+                        return merged_range
+                    else:
+                        break  # This merged range has data, try next direction
+            except:
+                continue
+        
+        # Not merged, check single cell
+        try:
+            field_cell = ws.cell(row=field_row, column=field_col)
+            if is_cell_empty(field_cell):
+                return field_cell.coordinate
+        except:
+            pass
     
     return None
 
@@ -119,8 +132,8 @@ def looks_like_label(text):
     
     text = text.strip()
     
-    # Too short or too long
-    if len(text) < 2 or len(text) > 40:
+    # Too short
+    if len(text) < 2:
         return False
     
     text_lower = text.lower()
@@ -132,6 +145,23 @@ def looks_like_label(text):
     if not (ends_with_colon or has_keyword):
         return False
     
+    # If it ends with colon, it's very likely a label (but check a few edge cases)
+    if ends_with_colon:
+        # Very long labels with colons are still labels, but check for obvious field values
+        if len(text) > 100:
+            return False
+        # If it looks like a URL or email with colon, skip
+        if '@' in text and not any(kw in text_lower for kw in ['email', 'correo', 'mail']):
+            return False
+        if text_lower.startswith(('http', 'www')):
+            return False
+        return True
+    
+    # For labels without colons, apply stricter rules
+    # Labels are usually shorter
+    if len(text) > 40:
+        return False
+    
     # Additional heuristics: labels are usually shorter and don't contain certain patterns
     # Field values often contain:
     # - Numbers in the middle (like addresses, phone numbers)
@@ -140,10 +170,7 @@ def looks_like_label(text):
     
     # If it has numbers in the middle (not just at start/end), it's likely a field value
     if re.search(r'\d+', text) and not text[0].isdigit() and not text[-1].isdigit():
-        # Has numbers but not at start/end - could be a field value
-        # But if it ends with colon, it's still a label
-        if not ends_with_colon:
-            return False
+        return False
     
     # If it contains @, it's likely an email field value, not a label
     if '@' in text and 'email' not in text_lower and 'correo' not in text_lower:
@@ -153,10 +180,15 @@ def looks_like_label(text):
     if text_lower.startswith(('http', 'www')):
         return False
     
+    # If it contains common field value patterns (like phone numbers, addresses)
+    if re.search(r'\d{3,}', text):  # Long sequences of numbers
+        return False
+    
     return True
 
 # Collect all potential fields with improved detection
 all_potential_fields = {}
+seen_coordinates = set()  # Track which field cells we've already mapped
 
 print("\n=== SCANNING FOR FORM FIELDS ===")
 
@@ -179,10 +211,11 @@ for row in ws.iter_rows():
         if not looks_like_label(label):
             continue
         
-        # Additional check: If there's significant text to the left, this might be a field value
-        # Labels are usually in the leftmost columns or have empty cells to their left
         row_idx = cell.row
         col_idx = cell.column
+        
+        # Additional check: If there's significant text to the left, this might be a field value
+        # Labels are usually in the leftmost columns or have empty cells to their left
         if col_idx > 1:  # Not in first column
             try:
                 left_cell = ws.cell(row=row_idx, column=col_idx - 1)
@@ -195,11 +228,17 @@ for row in ws.iter_rows():
             except:
                 pass
         
-        # Find the field cell to the right
-        target = find_field_cell_to_right(cell, merged_map)
+        # Find the field cell (checks multiple directions)
+        target = find_field_cell(cell, merged_map)
         
         if target is None:
             continue  # No valid field cell found
+        
+        # Get the top-left coordinate of the target (for deduplication)
+        if ":" in target:
+            target_top_left = target.split(":")[0]
+        else:
+            target_top_left = target
         
         # Verify the field cell is actually empty
         try:
@@ -214,10 +253,29 @@ for row in ws.iter_rows():
         except Exception as e:
             continue  # Skip if we can't verify
         
+        # Check for duplicate field cells
+        if target_top_left in seen_coordinates:
+            # This field cell is already mapped
+            # Only replace if the new label is more specific (ends with colon)
+            existing_label = None
+            for lbl, tgt in all_potential_fields.items():
+                tgt_tl = tgt.split(":")[0] if ":" in tgt else tgt
+                if tgt_tl == target_top_left:
+                    existing_label = lbl
+                    break
+            
+            if existing_label:
+                # If new label ends with colon and old one doesn't, replace
+                if label.rstrip().endswith(':') and not existing_label.rstrip().endswith(':'):
+                    del all_potential_fields[existing_label]
+                else:
+                    continue  # Keep existing mapping
+        
         # All checks passed - this is a valid label -> field mapping
         # Use the first occurrence if duplicate labels exist
         if label not in all_potential_fields:
             all_potential_fields[label] = target
+            seen_coordinates.add(target_top_left)
 
 print("\n=== FIELD DETECTION ANALYSIS ===")
 print(f"Total potential fields found (after improved filtering): {len(all_potential_fields)}")
@@ -379,71 +437,88 @@ if field_labels:
             # Fallback: simple string check
             return cell_coord == start or (start <= cell_coord <= end)
     
+    # Helper function to get the writable cell for a target (handles merged cells)
+    def get_writable_cell(target_coord):
+        """Get the actual writable cell for a target coordinate (handles merged cells)"""
+        if ":" in target_coord:
+            # This is a merged range
+            top_left = target_coord.split(":")[0]
+            # Check if it's in merged_map
+            if target_coord in merged_map:
+                return ws[merged_map[target_coord]]
+            else:
+                # Try to find it in merged_cells
+                for merged_range_obj in ws.merged_cells.ranges:
+                    if merged_range_obj.coord == target_coord:
+                        return ws.cell(row=merged_range_obj.min_row, column=merged_range_obj.min_col)
+                # Fallback to top-left
+                return ws[top_left]
+        else:
+            # Single cell
+            cell = ws[target_coord]
+            # If it's a MergedCell, find the top-left
+            if isinstance(cell, MergedCell):
+                for merged_range, top_left in merged_map.items():
+                    if is_cell_in_range(target_coord, merged_range):
+                        return ws[top_left]
+                # If we can't find it, try merged_cells directly
+                for merged_range_obj in ws.merged_cells.ranges:
+                    try:
+                        min_col, min_row, max_col, max_row = range_boundaries(merged_range_obj.coord)
+                        cell_col = ws[target_coord].column
+                        cell_row = ws[target_coord].row
+                        if min_col <= cell_col <= max_col and min_row <= cell_row <= max_row:
+                            return ws.cell(row=min_row, column=min_col)
+                    except:
+                        continue
+            return cell
+    
     # Fill Excel with the AI-generated data
     filled_count = 0
     skipped_count = 0
     
     for label, target in fields.items():
         try:
-            if label in data:
-                top_left = target.split(":")[0]  # merged or single
-                value = data[label]
-                
-                # Convert complex objects (dict, list) to JSON string
-                if isinstance(value, (dict, list)):
-                    value = json.dumps(value, ensure_ascii=False)
-                # Convert None to empty string
-                elif value is None:
-                    value = ""
-                
-                # Get the cell - handle merged cells properly
-                # If target is a merged range, use the top-left from merged_map
-                if ":" in target and target in merged_map:
-                    # This is a merged range, use the stored top-left cell
-                    writable_cell_coord = merged_map[target]
-                else:
-                    # Single cell or not in merged_map, use the coordinate directly
-                    writable_cell_coord = top_left
-                
-                cell = ws[writable_cell_coord]
-                
-                # If it's a MergedCell, find the actual top-left cell
-                if isinstance(cell, MergedCell):
-                    found_top_left = None
-                    # Find which merged range contains this cell
-                    for merged_range, merged_top_left in merged_map.items():
-                        if is_cell_in_range(writable_cell_coord, merged_range):
-                            found_top_left = merged_top_left
-                            break
-                    
-                    if found_top_left:
-                        cell = ws[found_top_left]
-                    else:
-                        # If we can't find the top-left, try to get it from the merged_cells
-                        for merged_range_obj in ws.merged_cells.ranges:
-                            # Check if our coordinate is in this range
-                            try:
-                                range_str = f"{get_column_letter(merged_range_obj.min_col)}{merged_range_obj.min_row}:{get_column_letter(merged_range_obj.max_col)}{merged_range_obj.max_row}"
-                                if is_cell_in_range(writable_cell_coord, range_str):
-                                    # Get the top-left cell of this merged range
-                                    cell = ws.cell(row=merged_range_obj.min_row, column=merged_range_obj.min_col)
-                                    break
-                            except:
-                                continue
-                        else:
-                            # Skip this cell if we can't find a writable cell
-                            print(f"  Skipped '{label}' -> {writable_cell_coord} (cannot find writable cell)")
-                            skipped_count += 1
-                            continue
-                
-                # Set the value on the writable cell
-                cell.value = value
-                filled_count += 1
-                print(f"  Filled '{label}' -> {cell.coordinate} with: {str(value)[:50]}...")
-            else:
+            if label not in data:
                 print(f"  Warning: '{label}' not found in AI response data")
+                skipped_count += 1
+                continue
+            
+            value = data[label]
+            
+            # Convert complex objects (dict, list) to JSON string
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False)
+            # Convert None to empty string
+            elif value is None:
+                value = ""
+            else:
+                # Convert to string
+                value = str(value)
+            
+            # Get the writable cell
+            try:
+                cell = get_writable_cell(target)
+            except Exception as e:
+                print(f"  Error getting writable cell for '{label}' -> {target}: {e}")
+                skipped_count += 1
+                continue
+            
+            # Verify the cell is still empty (double-check)
+            if not is_cell_empty(cell):
+                print(f"  Skipped '{label}' -> {cell.coordinate} (cell already has data: '{str(cell.value)[:30]}...')")
+                skipped_count += 1
+                continue
+            
+            # Set the value on the writable cell
+            cell.value = value
+            filled_count += 1
+            print(f"  ✓ Filled '{label}' -> {cell.coordinate} ({target}) with: {str(value)[:50]}...")
+            
         except Exception as e:
-            print(f"  Error filling '{label}': {e}")
+            print(f"  ✗ Error filling '{label}': {e}")
+            import traceback
+            traceback.print_exc()
             skipped_count += 1
             continue  # Continue with next field even if this one fails
     
